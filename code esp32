@@ -1,0 +1,650 @@
+
+#include <Wire.h>
+#include <math.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+
+// =====================================================
+// SMARTPOSTURE - ESP32 + MPU6050 + VIBRATION MOTOR
+// Bad posture must persist for 4 seconds before alert.
+// =====================================================
+
+// -------------------- Hardware ------------------------
+
+const uint8_t MPU_ADDR = 0x68;
+
+const int SDA_PIN = 21;
+const int SCL_PIN = 22;
+const int VIBRATION_PIN = 5;
+
+// -------------------- Wi-Fi / Backend ------------------
+// Change these to your Wi-Fi credentials.
+const char* WIFI_SSID = "Redmi Note 10 Pro";
+const char* WIFI_PASSWORD = "emna52944004";
+
+const char* SERVER_IP = "10.191.190.96";
+const uint16_t SERVER_PORT = 3000;
+const char* DEVICE_ID = "posture-belt-01";
+
+const unsigned long TELEMETRY_INTERVAL_MS = 5000;  // Send latest state every 5 s
+const unsigned long HEARTBEAT_INTERVAL_MS = 15000; // Backend specification
+const unsigned long HTTP_TIMEOUT_MS = 1500;
+
+// -------------------- Timing --------------------------
+
+const unsigned long SAMPLE_INTERVAL_MS = 100;
+const unsigned long ALERT_DELAY_MS = 4000;
+const unsigned long LOG_INTERVAL_MS = 500;
+
+// -------------------- Posture thresholds --------------
+// Based on the measurements supplied by the user.
+// These are experimental thresholds, not medical limits.
+
+const float GOOD_X_MIN = 104.0;
+const float GOOD_X_MAX = 120.0;
+const float GOOD_Y_MAX = 12.0;
+
+const float SLOUCH_X_MIN = 138.0;
+const float SLOUCH_Y_MAX = 15.0;
+
+const float LEAN_LEFT_Y_MIN = 25.0;
+const float LEAN_LEFT_X_MIN = 115.0;
+const float LEAN_LEFT_X_MAX = 140.0;
+
+const float LEAN_RIGHT_Y_MAX = -22.0;
+const float LEAN_RIGHT_X_MIN = 115.0;
+const float LEAN_RIGHT_X_MAX = 140.0;
+
+// -------------------- Sensor data ---------------------
+
+float ax = 0.0;
+float ay = 0.0;
+float az = 0.0;
+
+float angleX = 0.0;
+float angleY = 0.0;
+
+// -------------------- Posture states ------------------
+
+enum Posture {
+  GOOD_POSTURE,
+  SLOUCHING,
+  LEAN_LEFT,
+  LEAN_RIGHT,
+  UNKNOWN_POSTURE
+};
+
+Posture currentPosture = UNKNOWN_POSTURE;
+Posture previousPosture = UNKNOWN_POSTURE;
+
+// -------------------- Alert state ---------------------
+
+unsigned long badPostureStart = 0;
+unsigned long lastSample = 0;
+unsigned long lastLog = 0;
+unsigned long lastTelemetry = 0;
+unsigned long lastHeartbeat = 0;
+
+bool alertTriggered = false;
+
+// -------------------- Vibration patterns --------------
+
+// Each pattern consists of ON/OFF durations.
+// The patterns repeat while a bad-posture alert is active.
+
+struct PulsePattern {
+  unsigned int onMs;
+  unsigned int offMs;
+  unsigned int pulses;
+};
+
+PulsePattern activePattern = {0, 0, 0};
+
+unsigned int pulseIndex = 0;
+bool motorOn = false;
+unsigned long lastMotorChange = 0;
+Posture motorPatternPosture = UNKNOWN_POSTURE;
+
+// -----------------------------------------------------
+// Backend HTTP helpers
+// Backend base URL: http://192.168.100.2:3000
+// -----------------------------------------------------
+
+String backendUrl(const String& path) {
+  return String("http://") + SERVER_IP + ":" + String(SERVER_PORT) + path;
+}
+
+bool postJson(const String& path, const String& payload, const char* label) {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.printf("[NETWORK] %s skipped: Wi-Fi disconnected\n", label);
+    return false;
+  }
+
+  HTTPClient http;
+  http.setConnectTimeout(HTTP_TIMEOUT_MS);
+  http.setTimeout(HTTP_TIMEOUT_MS);
+
+  if (!http.begin(backendUrl(path))) {
+    Serial.printf("[HTTP] Could not start request: %s\n", label);
+    return false;
+  }
+
+  http.addHeader("Content-Type", "application/json");
+  int statusCode = http.POST(payload);
+
+  Serial.printf("[HTTP] %s -> status %d\n", label, statusCode);
+  if (statusCode > 0) {
+    String response = http.getString();
+    Serial.println(response);
+  } else {
+    Serial.printf("[HTTP] Request failed: %s\n", http.errorToString(statusCode).c_str());
+  }
+
+  http.end();
+  return statusCode >= 200 && statusCode < 300;
+}
+
+void sendTelemetry(unsigned long now) {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  unsigned long badDurationSeconds = 0;
+  if (currentPosture != GOOD_POSTURE &&
+      currentPosture != UNKNOWN_POSTURE &&
+      badPostureStart != 0) {
+    badDurationSeconds = (now - badPostureStart) / 1000UL;
+  }
+
+  // The backend expects posture.angle. Use the dominant measured angle
+  // as a compact summary; ax/ay/az and gx/gy/gz are sent separately.
+  float postureAngle = (fabs(angleX) >= fabs(angleY)) ? angleX : angleY;
+
+  StaticJsonDocument<512> doc;
+  doc["deviceId"] = DEVICE_ID;
+
+  JsonObject sensors = doc.createNestedObject("sensors");
+  sensors["ax"] = ax;
+  sensors["ay"] = ay;
+  sensors["az"] = az;
+  // Gyroscope is not currently read by this firmware, so gx/gy/gz are omitted.
+
+  JsonObject posture = doc.createNestedObject("posture");
+  posture["label"] = postureName(currentPosture);
+  posture["angle"] = postureAngle;
+  posture["badDurationSeconds"] = badDurationSeconds;
+
+  doc["alert"] = alertTriggered;
+  doc["samplingHz"] = 10;
+
+  String payload;
+  serializeJson(doc, payload);
+
+  postJson("/api/v1/telemetry", payload, "TELEMETRY");
+}
+
+void sendHeartbeat() {
+  StaticJsonDocument<128> doc;
+  // Battery is omitted because no battery sensor/voltage measurement
+  // has been configured in the current hardware.
+  String payload;
+  serializeJson(doc, payload);
+
+  postJson(String("/api/v1/devices/") + DEVICE_ID + "/heartbeat",
+           payload, "HEARTBEAT");
+}
+
+void connectWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  Serial.printf("[NETWORK] Connecting to Wi-Fi: %s", WIFI_SSID);
+  unsigned long startedAt = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - startedAt < 15000) {
+    delay(300);
+    Serial.print(".");
+  }
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("[NETWORK] Wi-Fi connected");
+    Serial.print("[NETWORK] ESP32 IP: ");
+    Serial.println(WiFi.localIP());
+    Serial.print("[NETWORK] Backend: http://");
+    Serial.print(SERVER_IP);
+    Serial.print(":");
+    Serial.println(SERVER_PORT);
+  } else {
+    Serial.println("[NETWORK] Wi-Fi connection timed out; posture detection continues offline.");
+  }
+}
+
+// -----------------------------------------------------
+// Read MPU6050 accelerometer
+// Assumes the default +/-2g accelerometer range.
+// -----------------------------------------------------
+
+bool readMPU6050() {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x3B);
+
+  if (Wire.endTransmission(false) != 0) {
+    return false;
+  }
+
+  uint8_t count = Wire.requestFrom(MPU_ADDR, (uint8_t)6);
+
+  if (count != 6) {
+    while (Wire.available()) {
+      Wire.read();
+    }
+    return false;
+  }
+
+  int16_t rawAX = (int16_t)((Wire.read() << 8) | Wire.read());
+  int16_t rawAY = (int16_t)((Wire.read() << 8) | Wire.read());
+  int16_t rawAZ = (int16_t)((Wire.read() << 8) | Wire.read());
+
+  ax = rawAX / 16384.0f * 9.80665f;
+  ay = rawAY / 16384.0f * 9.80665f;
+  az = rawAZ / 16384.0f * 9.80665f;
+
+  return true;
+}
+
+// -----------------------------------------------------
+// Calculate orientation angles
+// -----------------------------------------------------
+
+void calculateAngles() {
+  angleX = atan2(ay, az) * 180.0f / PI;
+
+  angleY = atan2(
+    -ax,
+    sqrt(ay * ay + az * az)
+  ) * 180.0f / PI;
+}
+
+// -----------------------------------------------------
+// Classify the current posture
+// -----------------------------------------------------
+
+Posture classifyPosture(float x, float y) {
+  // Correct posture
+  if (x >= GOOD_X_MIN &&
+      x <= GOOD_X_MAX &&
+      fabs(y) <= GOOD_Y_MAX) {
+    return GOOD_POSTURE;
+  }
+
+  // Forward slouching
+  if (x >= SLOUCH_X_MIN &&
+      fabs(y) <= SLOUCH_Y_MAX) {
+    return SLOUCHING;
+  }
+
+  // Leaning left
+  if (y >= LEAN_LEFT_Y_MIN &&
+      x >= LEAN_LEFT_X_MIN &&
+      x <= LEAN_LEFT_X_MAX) {
+    return LEAN_LEFT;
+  }
+
+  // Leaning right
+  if (y <= LEAN_RIGHT_Y_MAX &&
+      x >= LEAN_RIGHT_X_MIN &&
+      x <= LEAN_RIGHT_X_MAX) {
+    return LEAN_RIGHT;
+  }
+
+  return UNKNOWN_POSTURE;
+}
+
+// -----------------------------------------------------
+// Readable posture names
+// -----------------------------------------------------
+
+const char* postureName(Posture p) {
+  switch (p) {
+    case GOOD_POSTURE:
+      return "GOOD_POSTURE";
+    case SLOUCHING:
+      return "SLOUCHING";
+    case LEAN_LEFT:
+      return "LEAN_LEFT";
+    case LEAN_RIGHT:
+      return "LEAN_RIGHT";
+    default:
+      return "UNKNOWN"; // Must match the backend enum exactly.
+  }
+}
+
+const char* postureMessage(Posture p) {
+  switch (p) {
+    case GOOD_POSTURE:
+      return "Posture is within the configured good range.";
+    case SLOUCHING:
+      return "Possible slouching. Sit upright and straighten your back.";
+    case LEAN_LEFT:
+      return "Possible left lean. Bring your torso back to the center.";
+    case LEAN_RIGHT:
+      return "Possible right lean. Bring your torso back to the center.";
+    default:
+      return "Posture is uncertain. Keep the sensor stable.";
+  }
+}
+
+// -----------------------------------------------------
+// Stop the motor and reset its pattern
+// -----------------------------------------------------
+
+void stopVibration() {
+  digitalWrite(VIBRATION_PIN, LOW);
+
+  motorOn = false;
+  pulseIndex = 0;
+  motorPatternPosture = UNKNOWN_POSTURE;
+  lastMotorChange = millis();
+}
+
+// -----------------------------------------------------
+// Configure a distinct vibration pattern
+// -----------------------------------------------------
+
+void startVibrationPattern(Posture p) {
+  stopVibration();
+
+  motorPatternPosture = p;
+
+  switch (p) {
+    case SLOUCHING:
+      // One long pulse, then a short pause
+      activePattern = {700, 300, 1};
+      break;
+
+    case LEAN_LEFT:
+      // Two short pulses
+      activePattern = {180, 180, 2};
+      break;
+
+    case LEAN_RIGHT:
+      // Three short pulses
+      activePattern = {150, 150, 3};
+      break;
+
+    default:
+      activePattern = {0, 0, 0};
+      return;
+  }
+
+  pulseIndex = 0;
+  motorOn = true;
+  digitalWrite(VIBRATION_PIN, HIGH);
+  lastMotorChange = millis();
+
+  Serial.print("[VIBRATION] Pattern started for ");
+  Serial.println(postureName(p));
+}
+
+// -----------------------------------------------------
+// Update the vibration motor without blocking the loop
+// -----------------------------------------------------
+
+void updateVibration(bool alertActive, Posture p) {
+  if (!alertActive ||
+      p == GOOD_POSTURE ||
+      p == UNKNOWN_POSTURE) {
+    if (motorOn || motorPatternPosture != UNKNOWN_POSTURE) {
+      stopVibration();
+      Serial.println("[VIBRATION] OFF");
+    }
+    return;
+  }
+
+  // Start a new pattern when the posture changes
+  if (p != motorPatternPosture) {
+    startVibrationPattern(p);
+    return;
+  }
+
+  unsigned long now = millis();
+
+  unsigned long duration = motorOn
+      ? activePattern.onMs
+      : activePattern.offMs;
+
+  if (now - lastMotorChange < duration) {
+    return;
+  }
+
+  lastMotorChange = now;
+
+  if (motorOn) {
+    // Finish the ON pulse
+    motorOn = false;
+    digitalWrite(VIBRATION_PIN, LOW);
+  } else {
+    pulseIndex++;
+
+    if (pulseIndex >= activePattern.pulses) {
+      // Repeat this pattern after the pause
+      pulseIndex = 0;
+    }
+
+    motorOn = true;
+    digitalWrite(VIBRATION_PIN, HIGH);
+  }
+}
+
+// -----------------------------------------------------
+// Reset the bad-posture timer
+// -----------------------------------------------------
+
+void resetBadPostureTimer() {
+  badPostureStart = 0;
+  alertTriggered = false;
+}
+
+// -----------------------------------------------------
+// Detailed serial output
+// -----------------------------------------------------
+
+void printStatus(unsigned long now) {
+  Serial.println();
+  Serial.println("========== SMARTPOSTURE STATUS ==========");
+
+  Serial.print("AX: ");
+  Serial.print(ax, 2);
+  Serial.print(" | AY: ");
+  Serial.print(ay, 2);
+  Serial.print(" | AZ: ");
+  Serial.println(az, 2);
+
+  Serial.print("AngleX: ");
+  Serial.print(angleX, 2);
+  Serial.print(" deg | AngleY: ");
+  Serial.print(angleY, 2);
+  Serial.println(" deg");
+
+  Serial.print("Detected posture: ");
+  Serial.println(postureName(currentPosture));
+
+  Serial.print("Guidance: ");
+  Serial.println(postureMessage(currentPosture));
+
+  if (currentPosture == GOOD_POSTURE) {
+    Serial.println("Status: OK - no alert required.");
+    Serial.println("Vibration: OFF");
+  } else if (currentPosture == UNKNOWN_POSTURE) {
+    Serial.println("Status: MONITORING - posture uncertain.");
+    Serial.println("Vibration: OFF");
+  } else {
+    unsigned long elapsed = now - badPostureStart;
+
+    Serial.print("Bad posture duration: ");
+    Serial.print(elapsed / 1000.0f, 1);
+    Serial.println(" seconds");
+
+    if (alertTriggered) {
+      Serial.println("Status: BAD POSTURE ALERT ACTIVE!");
+      Serial.println("Vibration: ACTIVE - repeating posture pattern");
+      Serial.println("Action: Correct your posture.");
+    } else {
+      unsigned long remaining =
+        elapsed >= ALERT_DELAY_MS
+        ? 0
+        : ALERT_DELAY_MS - elapsed;
+
+      Serial.print("Status: WAITING FOR 4 SECONDS | Alert in: ");
+      Serial.print(remaining / 1000.0f, 1);
+      Serial.println(" seconds");
+
+      Serial.println("Vibration: OFF until the alert activates.");
+    }
+  }
+
+  Serial.println("=========================================");
+}
+
+// -----------------------------------------------------
+// Setup
+// -----------------------------------------------------
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  connectWiFi();
+
+  pinMode(VIBRATION_PIN, OUTPUT);
+  digitalWrite(VIBRATION_PIN, LOW);
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x6B);
+  Wire.write(0x00);
+
+  if (Wire.endTransmission() != 0) {
+    Serial.println("ERROR: MPU6050 not detected.");
+    Serial.println("Check power, GND, SDA, SCL and I2C address.");
+
+    stopVibration();
+
+    while (true) {
+      delay(1000);
+    }
+  }
+
+  Serial.println();
+  Serial.println("=========================================");
+  Serial.println("         SMARTPOSTURE STARTED");
+  Serial.println("=========================================");
+  Serial.println("Sensor: MPU6050");
+  Serial.println("Device ID: posture-belt-01");
+  Serial.println("Backend telemetry: every 5 seconds");
+  Serial.println("Backend heartbeat: every 15 seconds");
+  Serial.println("Motor control pin: GPIO 5");
+  Serial.println("Bad-posture delay: 4 seconds");
+  Serial.println("Serial Monitor: 115200 baud");
+  Serial.println("Vibration output must use a suitable driver.");
+  Serial.println("=========================================");
+}
+
+// -----------------------------------------------------
+// Main loop
+// -----------------------------------------------------
+
+void loop() {
+  unsigned long now = millis();
+
+  if (now - lastSample < SAMPLE_INTERVAL_MS) {
+    return;
+  }
+
+  lastSample = now;
+
+  if (!readMPU6050()) {
+    Serial.println("[ERROR] Failed to read MPU6050.");
+
+    resetBadPostureTimer();
+    currentPosture = UNKNOWN_POSTURE;
+    stopVibration();
+
+    return;
+  }
+
+  calculateAngles();
+
+  previousPosture = currentPosture;
+  currentPosture = classifyPosture(angleX, angleY);
+
+  // Correct or uncertain posture cancels the timer
+  if (currentPosture == GOOD_POSTURE ||
+      currentPosture == UNKNOWN_POSTURE) {
+    resetBadPostureTimer();
+  } else {
+    // Start/restart the timer when entering or changing
+    // a bad posture category.
+    if (badPostureStart == 0 ||
+        currentPosture != previousPosture) {
+      badPostureStart = now;
+      alertTriggered = false;
+
+      Serial.println();
+      Serial.print("[DETECTED] ");
+      Serial.println(postureName(currentPosture));
+      Serial.println(postureMessage(currentPosture));
+      Serial.println("The posture must persist for 4 seconds.");
+    }
+
+    if (!alertTriggered &&
+        now - badPostureStart >= ALERT_DELAY_MS) {
+      alertTriggered = true;
+
+      Serial.println();
+      Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+      Serial.println("          BAD POSTURE ALERT!");
+      Serial.print("Detected posture: ");
+      Serial.println(postureName(currentPosture));
+      Serial.println(postureMessage(currentPosture));
+      Serial.println("Duration: at least 4 continuous seconds.");
+      Serial.println("Vibration pattern activated.");
+      Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+    }
+  }
+
+  bool alertActive =
+      alertTriggered &&
+      currentPosture != GOOD_POSTURE &&
+      currentPosture != UNKNOWN_POSTURE;
+
+  updateVibration(alertActive, currentPosture);
+
+  // Reconnect if Wi-Fi drops. Local posture detection and vibration
+  // continue even while the backend is unavailable.
+  if (WiFi.status() != WL_CONNECTED) {
+    static unsigned long lastReconnectAttempt = 0;
+    if (now - lastReconnectAttempt >= 10000UL) {
+      lastReconnectAttempt = now;
+      Serial.println("[NETWORK] Wi-Fi lost; attempting reconnect...");
+      WiFi.reconnect();
+    }
+  }
+
+  if (WiFi.status() == WL_CONNECTED &&
+      now - lastTelemetry >= TELEMETRY_INTERVAL_MS) {
+    lastTelemetry = now;
+    sendTelemetry(now);
+  }
+
+  if (WiFi.status() == WL_CONNECTED &&
+      now - lastHeartbeat >= HEARTBEAT_INTERVAL_MS) {
+    lastHeartbeat = now;
+    sendHeartbeat();
+  }
+
+  if (now - lastLog >= LOG_INTERVAL_MS) {
+    lastLog = now;
+    printStatus(now);
+  }
+}

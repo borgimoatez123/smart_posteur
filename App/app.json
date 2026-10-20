@@ -1,0 +1,67 @@
+{
+  "expo": {
+    "name": "SmartPosture",
+    "slug": "smartposture",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "scheme": "smartposture",
+    "userInterfaceStyle": "automatic",
+    "newArchEnabled": true,
+    "splash": {
+      "resizeMode": "contain",
+      "backgroundColor": "#0B1F3A"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.smartposture.app",
+      "infoPlist": {
+        "NSBluetoothAlwaysUsageDescription": "SmartPosture uses Bluetooth to connect to your wearable posture sensor.",
+        "NSBluetoothPeripheralUsageDescription": "SmartPosture uses Bluetooth to connect to your wearable posture sensor."
+      }
+    },
+    "android": {
+      "package": "com.smartposture.app",
+      "permissions": [
+        "BLUETOOTH",
+        "BLUETOOTH_ADMIN",
+        "BLUETOOTH_SCAN",
+        "BLUETOOTH_CONNECT",
+        "ACCESS_FINE_LOCATION",
+        "ACCESS_COARSE_LOCATION",
+        "POST_NOTIFICATIONS"
+      ],
+      "intentFilters": [
+        {
+          "action": "VIEW",
+          "autoVerify": true,
+          "data": [
+            {
+              "scheme": "smartposture"
+            }
+          ],
+          "category": ["BROWSABLE", "DEFAULT"]
+        }
+      ]
+    },
+    "web": {
+      "bundler": "metro",
+      "output": "single",
+      "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      "expo-router",
+      "./plugins/withAndroidCleartextTraffic",
+      [
+        "react-native-ble-plx",
+        {
+          "isBackgroundEnabled": true,
+          "modes": ["peripheral", "central"]
+        }
+      ]
+    ],
+    "experiments": {
+      "typedRoutes": true
+    }
+  }
+}

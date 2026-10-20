@@ -1,0 +1,896 @@
+================================================================================
+  SMARTPOSTURE BACKEND SERVER  -  FLOW REPORT & POSTMAN TESTING GUIDE
+================================================================================
+Version    : 1.0
+Last update: 2026-10-17
+Base stack : Node.js + TypeScript + Express + MongoDB (Mongoose) + Socket.IO (opt.)
+Auth       : NONE (no login / no JWT / no user accounts)
+================================================================================
+
+
+--------------------------------------------------------------------------------
+1. HOW THE SYSTEM FLOWS  (end to end)
+--------------------------------------------------------------------------------
+
+  [ ESP32 + MPU6050 ]
+        |  (Wi-Fi, HTTP REST)
+        |  POST /api/v1/telemetry         <- raw sensor + posture samples
+        |  POST /api/v1/devices/:id/heartbeat  <- every 15s
+        v
+  [ SmartPosture Backend  -- this server ]
+        |  validation (Zod)  ->  services  ->  MongoDB (Mongoose models)
+        |
+        |  optional push (Socket.IO):
+        |     "posture:update"   when new telemetry stored
+        |     "device:status"    when a device goes online/offline
+        |     "posture:alert"    when alert flag is true
+        v
+  [ Flutter mobile app ]
+        |  reads dashboard / history / sessions / events / ai
+        v
+  [ Gemini AI  (optional) ] via POST /api/v1/ai/recommendations
+        - only aggregated statistics are sent (never raw or personal data)
+
+
+  Key behaviors:
+    * Telemetry ingestion is IDEMPOTENT.
+        - 1st time a sample is stored  -> HTTP 201
+        - retry of the same sample     -> HTTP 200 (duplicate ignored)
+      The dedupe key is: deviceId : ISO-timestamp : posture label : alert flag
+    * Device online/offline is computed "on read" using a heartbeat timeout
+      (default 60s, DEVICE_OFFLINE_TIMEOUT_SECONDS) plus a background sweeper.
+    * Dashboard / Session durations are derived from TIMESTAMP DELTAS
+      (never "1 sample = 1 second"). UNKNOWN posture is excluded from
+      good/bad durations.
+    * /health always returns 200 and reports REAL DB state ("ok"/"degraded").
+
+
+--------------------------------------------------------------------------------
+2. BASE URLs  (for Postman environment variables)
+--------------------------------------------------------------------------------
+
+  Local machine          : http://localhost:3000
+  Android emulator       : http://10.0.2.2:3000
+  Physical phone / ESP32 : http://<your-LAN-ip>:3000
+                           (the exact IP is printed by the server at startup)
+
+  Suggested Postman variable:  {{baseUrl}} = http://localhost:3000
+
+  Docs (Swagger UI) : GET {{baseUrl}}/docs           (open in browser)
+  OpenAPI JSON      : GET {{baseUrl}}/openapi.json
+
+
+--------------------------------------------------------------------------------
+3. STANDARD RESPONSE ENVELOPE
+--------------------------------------------------------------------------------
+
+  SUCCESS:
+  {
+    "success": true,
+    "message": "...",
+    "data": { ... }
+  }
+
+  ERROR:
+  {
+    "success": false,
+    "message": "...",
+    "error": {
+      "code": "SOME_CODE",
+      "details": { ... }         // optional, e.g. validation issues[]
+    }
+  }
+
+  Validation errors (HTTP 400) return:
+    "error": { "code": "VALIDATION_ERROR", "details": { "issues": [ ... ] } }
+
+
+--------------------------------------------------------------------------------
+4. SHARED ENUMS / CONSTANTS  (use exact strings)
+--------------------------------------------------------------------------------
+
+  posture.label          : GOOD_POSTURE | SLOUCHING | LEAN_LEFT | LEAN_RIGHT
+                           | HEAD_FORWARD | UNKNOWN
+
+  event.type             : POSTURE_INCORRECT | VIBRATION_ALERT | DEVICE_DISCONNECTED
+                           | DEVICE_RECONNECTED | LOW_BATTERY | SENSOR_ERROR
+
+  event.severity         : info | warning | critical
+                           (default when omitted:
+                              SENSOR_ERROR -> critical,
+                              DEVICE_RECONNECTED -> info,
+                              all others -> warning)
+
+  device status           : online | offline | unknown
+
+  period (dashboard / ai): day | week | month      (default = "day")
+
+  list sort               : asc | desc             (default = "desc")
+
+  pagination defaults     : page = 1 , limit = 20  (limit max = 200)
+
+  deviceId rules          : 3..64 chars, only A-Z a-z 0-9 . _ : -
+  timestamp rules         : ISO-8601 string, e.g. 2026-10-17T09:30:00.000Z
+  Mongo id (path/param)   : 24 hex chars, e.g. 652f1a2b3c4d5e6f7a8b9c0d
+
+
+================================================================================
+5. ENDPOINTS  -  FULL LIST
+   Each entry: METHOD, URL, query/params, JSON body, expected status.
+================================================================================
+
+
+--------------------------------------------------------------------------------
+[01]  HEALTH CHECK
+--------------------------------------------------------------------------------
+  METHOD : GET
+  URL    : {{baseUrl}}/health
+  Auth   : none
+  Body   : none
+  Params : none
+
+  Success 200 (DB connected):
+  {
+    "status": "ok",
+    "database": "connected",
+    "timestamp": "2026-10-17T09:30:00.000Z"
+  }
+
+  Success 200 (DB down -> "degraded", NOT an error):
+  {
+    "status": "degraded",
+    "database": "disconnected",
+    "timestamp": "2026-10-17T09:30:00.000Z",
+    "databaseError": "MongoDB is not connected"
+  }
+
+
+--------------------------------------------------------------------------------
+[02]  INGEST TELEMETRY  (sent by the ESP32)
+--------------------------------------------------------------------------------
+  METHOD : POST
+  URL    : {{baseUrl}}/api/v1/telemetry
+  Auth   : none
+  Body   : raw JSON (Content-Type: application/json)
+
+  MINIMAL VALID BODY:
+  {
+    "deviceId": "posture-belt-01",
+    "posture": {
+      "label": "SLOUCHING",
+      "angle": 28.4
+    }
+  }
+
+  FULL BODY (all optional fields shown):
+  {
+    "deviceId": "posture-belt-01",
+    "timestamp": "2026-10-17T09:30:00.000Z",
+    "sensors": {
+      "ax": 0.12, "ay": -9.71, "az": 1.03,
+      "gx": 1.5,  "gy": 0.0,   "gz": -0.4
+    },
+    "posture": {
+      "label": "SLOUCHING",
+      "angle": 28.4,
+      "confidence": 0.93,
+      "badDurationSeconds": 12
+    },
+    "alert": false,
+    "battery": 87,
+    "samplingHz": 10
+  }
+
+  Field constraints:
+    deviceId            : required (3..64, see rules)
+    timestamp           : optional ISO-8601 (if omitted, server uses now)
+    sensors             : optional | null
+        ax/ay/az        : -160..160   (m/s^2, +/-16g)   each optional/nullable
+        gx/gy/gz        : -2000..2000 (deg/s)           each optional/nullable
+    posture             : required
+        label           : required enum
+        angle           : required, -180..180
+        confidence      : optional 0..1 (nullable)
+        badDurationSeconds : optional 0..86400 (nullable)
+    alert               : optional boolean (default false)
+    battery             : optional integer 0..100 (nullable)
+    samplingHz          : optional positive number <= 200 (nullable)
+
+  Success 201 (new record stored):
+  {
+    "success": true,
+    "message": "Telemetry stored",
+    "data": { "id": "<mongoId>", "duplicate": false,
+              "sessionId": null, "events": 0 }
+  }
+
+  Success 200 (retry of identical sample -> ignored):
+  {
+    "success": true,
+    "message": "Duplicate telemetry ignored",
+    "data": { "id": "<mongoId>", "duplicate": true,
+              "sessionId": null, "events": 0 }
+  }
+
+  Errors: 400 VALIDATION_ERROR | 429 rate limited | 500 INTERNAL_ERROR
+          (503 DATABASE_UNAVAILABLE if DB down)
+
+
+--------------------------------------------------------------------------------
+[03]  LIST ALL DEVICES
+--------------------------------------------------------------------------------
+  METHOD : GET
+  URL    : {{baseUrl}}/api/v1/devices
+  Body   : none
+  Success 200:
+  {
+    "success": true, "message": "OK",
+    "data": { "devices": [ { "deviceId": "...", "status": "online", ... } ],
+              "count": 1 }
+  }
+
+
+--------------------------------------------------------------------------------
+[04]  GET ONE DEVICE
+--------------------------------------------------------------------------------
+  METHOD : GET
+  URL    : {{baseUrl}}/api/v1/devices/:deviceId
+  Example: {{baseUrl}}/api/v1/devices/posture-belt-01
+  Body   : none
+  Success 200 : data = device view
+  Errors: 404 DEVICE_NOT_FOUND
+
+
+--------------------------------------------------------------------------------
+[05]  GET DEVICE STATUS
+--------------------------------------------------------------------------------
+  METHOD : GET
+  URL    : {{baseUrl}}/api/v1/devices/:deviceId/status
+  Example: {{baseUrl}}/api/v1/devices/posture-belt-01/status
+  Body   : none
+  Success 200 : data includes:
+      { deviceId, status: "online"|"offline"|"unknown",
+        lastSeen, offlineTimeoutSeconds, heartbeatIntervalSeconds }
+  Errors: 404 DEVICE_NOT_FOUND
+
+
+--------------------------------------------------------------------------------
+[06]  DEVICE HEARTBEAT  (sent by the ESP32 every 15s)
+--------------------------------------------------------------------------------
+  METHOD : POST
+  URL    : {{baseUrl}}/api/v1/devices/:deviceId/heartbeat
+  Example: {{baseUrl}}/api/v1/devices/posture-belt-01/heartbeat
+
+  BODY (optional - an empty body {} is also accepted):
+  {
+    "battery": 76,
+    "timestamp": "2026-10-17T09:31:00.000Z"
+  }
+
+  Success 200 ("Heartbeat recorded"):
+  {
+    "success": true,
+    "message": "Heartbeat recorded",
+    "data": {
+      "deviceId": "posture-belt-01",
+      "status": "online",
+      "lastSeen": "2026-10-17T09:31:00.000Z",
+      "reconnectDetected": false,
+      "nextHeartbeatSeconds": 15
+    }
+  }
+  Note: reconnectDetected=true -> emits DEVICE_RECONNECTED (exactly once).
+
+
+--------------------------------------------------------------------------------
+[07]  DASHBOARD (aggregate snapshot)
+--------------------------------------------------------------------------------
+  METHOD : GET
+  URL    : {{baseUrl}}/api/v1/dashboard
+  Query  : deviceId (optional)   -> filter a single device
+  Body   : none
+  Success 200 : data = { generatedAt, current, summary }
+  Empty state is explicit (e.g. hasData=false / available=false).
+
+
+--------------------------------------------------------------------------------
+[08]  DASHBOARD - CURRENT POSTURE
+--------------------------------------------------------------------------------
+  METHOD : GET
+  URL    : {{baseUrl}}/api/v1/dashboard/current
+  Query  : deviceId (optional)
+  Body   : none
+  Success 200 : data = current posture view
+      { available, message?, label, angle, timestamp, alert, deviceId, ... }
+  Note: message != "OK" signals an explicit empty/unknown state (not an error).
+
+
+--------------------------------------------------------------------------------
+[09]  DASHBOARD - SUMMARY (by period)
+--------------------------------------------------------------------------------
+  METHOD : GET
+  URL    : {{baseUrl}}/api/v1/dashboard/summary?period=day
+  Query  : period = day | week | month   (default day)
+           deviceId (optional)
+  Body   : none
+  Success 200 : data = summary
+      { period, deviceId, range{from,to}, hasData,
+        totals{ measurements, incorrectPostureEvents, goodDurationSeconds,
+                badDurationSeconds, monitoredDurationSeconds,
+                goodPosturePercentage, averageAngle },
+        postureDistribution[], trends[] }
+  Examples:
+      {{baseUrl}}/api/v1/dashboard/summary?period=day
+      {{baseUrl}}/api/v1/dashboard/summary?period=week&deviceId=posture-belt-01
+
+
+--------------------------------------------------------------------------------
+[10]  HISTORY - LIST (paginated, filtered)
+--------------------------------------------------------------------------------
+  METHOD : GET
+  URL    : {{baseUrl}}/api/v1/history
+  Query (all optional):
+      page        : >=1            (default 1)
+      limit       : 1..200         (default 20)
+      deviceId    : filter
+      posture     : GOOD_POSTURE | SLOUCHING | LEAN_LEFT | LEAN_RIGHT
+                    | HEAD_FORWARD | UNKNOWN
+      alert       : true | false
+      sessionId   : 24-hex id
+      sort        : asc | desc      (default desc)
+      from        : date/time       (>= filter)
+      to          : date/time       (<= filter)   [from must be <= to]
+  Body   : none
+  Success 200 : data = { items: [ HistoryView... ],
+                         meta: { page, limit, total, totalPages,
+                                 hasNextPage, hasPreviousPage } }
+  HistoryView item fields:
+      { id, deviceId, timestamp, receivedAt, sensors, posture, alert,
+        battery, sensorError, sessionId, samplingHz }
+
+  Example:
+      {{baseUrl}}/api/v1/history?page=1&limit=20&posture=SLOUCHING&sort=desc
+      {{baseUrl}}/api/v1/history?from=2026-10-16T00:00:00.000Z&to=2026-10-17T00:00:00.000Z
+
+
+--------------------------------------------------------------------------------
+[11]  HISTORY - GET ONE
+--------------------------------------------------------------------------------
+  METHOD : GET
+  URL    : {{baseUrl}}/api/v1/history/:id
+  Example: {{baseUrl}}/api/v1/history/652f1a2b3c4d5e6f7a8b9c0d
+  Body   : none
+  Success 200 : data = single history record
+  Errors: 404 TELEMETRY_NOT_FOUND
+          400 VALIDATION_ERROR (id not 24-hex)
+
+
+--------------------------------------------------------------------------------
+[12]  SESSIONS - LIST
+--------------------------------------------------------------------------------
+  METHOD : GET
+  URL    : {{baseUrl}}/api/v1/sessions
+  Query (all optional):
+      page, limit, deviceId, status = active | ended, sort = asc | desc,
+      from, to
+  Body   : none
+  Success 200 : data = { items: [ SessionView... ], meta: {...} }
+  SessionView fields:
+      { id, deviceId, status, startedAt, endedAt, durationSeconds,
+        statistics{ measurements, incorrectPostureEvents, goodDurationSeconds,
+                    badDurationSeconds, monitoredDurationSeconds,
+                    goodPosturePercentage, averageAngle },
+        statisticsAreFinal, notes, createdAt }
+
+
+--------------------------------------------------------------------------------
+[13]  SESSIONS - START
+--------------------------------------------------------------------------------
+  METHOD : POST
+  URL    : {{baseUrl}}/api/v1/sessions
+  Body   :
+  {
+    "deviceId": "posture-belt-01",
+    "startedAt": "2026-10-17T09:00:00.000Z",
+    "notes": "Morning monitoring"
+  }
+  (startedAt and notes are optional)
+
+  Success 201 ("Session started")        -> new session created
+  Success 200 ("Existing active session returned")
+                                         -> a session was already open
+     data = SessionView
+  Errors: 400 VALIDATION_ERROR
+
+
+--------------------------------------------------------------------------------
+[14]  SESSIONS - GET ONE
+--------------------------------------------------------------------------------
+  METHOD : GET
+  URL    : {{baseUrl}}/api/v1/sessions/:id
+  Example: {{baseUrl}}/api/v1/sessions/652f1a2b3c4d5e6f7a8b9c0d
+  Body   : none
+  Success 200 : data = SessionView (live statistics while active)
+  Errors: 404 SESSION_NOT_FOUND | 400 VALIDATION_ERROR
+
+
+--------------------------------------------------------------------------------
+[15]  SESSIONS - END
+--------------------------------------------------------------------------------
+  METHOD : PATCH
+  URL    : {{baseUrl}}/api/v1/sessions/:id/end
+  Body (all optional - empty {} allowed):
+  {
+    "endedAt": "2026-10-17T10:15:00.000Z",
+    "notes": "Lunch break"
+  }
+  Success 200 ("Session ended")  -> statistics now FINAL
+  Success 200 ("Session was already ended") -> idempotent, unchanged
+  Errors: 400 VALIDATION_ERROR | 404 SESSION_NOT_FOUND
+
+
+--------------------------------------------------------------------------------
+[16]  EVENTS - LIST
+--------------------------------------------------------------------------------
+  METHOD : GET
+  URL    : {{baseUrl}}/api/v1/events
+  Query (all optional):
+      page, limit, deviceId,
+      type     : POSTURE_INCORRECT | VIBRATION_ALERT | DEVICE_DISCONNECTED
+                 | DEVICE_RECONNECTED | LOW_BATTERY | SENSOR_ERROR,
+      severity : info | warning | critical,
+      sessionId: 24-hex,
+      sort     : asc | desc (default desc),
+      from, to
+  Body   : none
+  Success 200 : data = { items: [ EventView... ], meta: {...} }
+  EventView fields:
+      { id, deviceId, sessionId, type, severity, timestamp, metadata }
+
+
+--------------------------------------------------------------------------------
+[17]  EVENTS - CREATE
+--------------------------------------------------------------------------------
+  METHOD : POST
+  URL    : {{baseUrl}}/api/v1/events
+  Body   :
+  {
+    "deviceId": "posture-belt-01",
+    "type": "VIBRATION_ALERT",
+    "severity": "warning",
+    "timestamp": "2026-10-17T09:35:00.000Z",
+    "sessionId": "652f1a2b3c4d5e6f7a8b9c0d",
+    "metadata": { "durationSeconds": 4 },
+    "dedupeKey": "posture-belt-01:VIBRATION_ALERT:2026-10-17T09:35:00.000Z"
+  }
+  (severity, timestamp, sessionId, metadata, dedupeKey all optional)
+
+  Success 201 ("Event stored")           -> new event
+  Success 200 ("Event already exists")   -> duplicate dedupeKey ignored
+  Errors: 400 VALIDATION_ERROR
+
+
+--------------------------------------------------------------------------------
+[18]  EVENTS - GET ONE
+--------------------------------------------------------------------------------
+  METHOD : GET
+  URL    : {{baseUrl}}/api/v1/events/:id
+  Example: {{baseUrl}}/api/v1/events/652f1a2b3c4d5e6f7a8b9c0d
+  Body   : none
+  Success 200 : data = EventView
+  Errors: 404 EVENT_NOT_FOUND | 400 VALIDATION_ERROR
+
+
+--------------------------------------------------------------------------------
+[19]  AI - GENERATE RECOMMENDATIONS  (Gemini, optional)
+--------------------------------------------------------------------------------
+  METHOD : POST
+  URL    : {{baseUrl}}/api/v1/ai/recommendations
+  Body (all optional - empty {} allowed):
+  {
+    "period": "day",
+    "deviceId": "posture-belt-01",
+    "refresh": false
+  }
+  Body fields:
+      period  : day | week | month (default day)
+      deviceId: optional
+      refresh : optional boolean (default false) - bypass cache
+
+  Success 200 ("Recommendation generated" OR "Recommendation served from cache"):
+  data = {
+      id, period, deviceId, generatedAt, summary,
+      recommendations: [ { title, detail, priority: low|medium|high } ],
+      model, status: success|error|unavailable, error, cached,
+      aiConfigured, disclaimer
+  }
+  Errors:
+      400 VALIDATION_ERROR
+      503 GEMINI_NOT_CONFIGURED   (no GEMINI_API_KEY set)
+      429 GEMINI_RATE_LIMITED     (also AI rate limiter)
+      502 GEMINI_UNAUTHORIZED / BAD_GATEWAY
+      504 GATEWAY_TIMEOUT
+  Note: if statistics are empty, NO_POSTURE_DATA may be returned.
+
+
+--------------------------------------------------------------------------------
+[20]  AI - LATEST RECOMMENDATION
+--------------------------------------------------------------------------------
+  METHOD : GET
+  URL    : {{baseUrl}}/api/v1/ai/recommendations/latest?period=day
+  Query  : period = day | week | month (default day)
+           deviceId (optional)
+  Body   : none
+  Success 200 : data = RecommendationView (the last stored one)
+  Errors: 404 RECOMMENDATION_NOT_FOUND | 400 VALIDATION_ERROR
+
+
+--------------------------------------------------------------------------------
+[21]  AI - LIVE RECOMMENDATION  (real recent telemetry, Gemini + fallback)
+--------------------------------------------------------------------------------
+  METHOD : GET
+  URL    : {{baseUrl}}/api/v1/ai/recommendations/live?deviceId=posture-belt-01
+  Query  : deviceId      (optional, 3..64 chars)
+           windowMinutes (optional, 1..120, default AI_LIVE_WINDOW_MINUTES=10)
+  Body   : none
+
+  What it does:
+      * reads the LATEST real telemetry from MongoDB inside the rolling window
+      * computes the current posture, distribution, average angle, posture
+        changes and the ongoing incorrect-posture duration
+      * sends ONLY aggregated numbers to Gemini, and personalises the advice
+      * NEVER stores a historical recommendation (nothing is written to Mongo)
+      * ALWAYS answers 200 with usable advice, even without a Gemini key
+
+  Success 200 (data = LiveRecommendationView):
+  {
+    "deviceId": "posture-belt-01",
+    "available": true,
+    "stale": false,
+    "dataQuality": "recent",                 // none | limited | recent | established
+    "windowMinutes": 10,
+    "sampleCount": 42,
+    "observedFrom": "2026-10-17T09:20:03.000Z",
+    "observedTo":   "2026-10-17T09:29:57.000Z",
+    "latestSampleAgeSeconds": 3.5,
+    "current": {
+      "posture": "SLOUCHING",
+      "angle": 28.4,
+      "confidence": 0.91,
+      "alert": false,
+      "timestamp": "2026-10-17T09:29:57.000Z"
+    },
+    "dominantPosture": "SLOUCHING",
+    "postureDistribution": [ { "label": "SLOUCHING", "count": 30, "percentage": 71.43 } ],
+    "averageAngle": 26.1,
+    "angleDelta": 3.2,
+    "postureChanges": 6,
+    "incorrectPostureEvents": 4,
+    "persistentIncorrectSeconds": 12.5,
+    "monitoredDurationSeconds": 594,
+    "goodPosturePercentage": 28.57,
+    "summary": "The latest 42 readings over the last 10 min indicate forward slouching. ...",
+    "advice": {
+      "title": "Straighten your back gradually",
+      "immediateAction": "Sit upright, relax your shoulders ...",
+      "futureImpact": "Repeatedly spending long periods slouched ...",
+      "priority": "medium"
+    },
+    "source": "gemini",                      // gemini | fallback | none
+    "model": "gemini-3.5-flash-lite",        // null when source != gemini
+    "cached": false,
+    "generatedAt": "2026-10-17T09:30:00.000Z",
+    "aiConfigured": true,
+    "disclaimer": "...",
+    "message": "Live recommendation generated"
+  }
+
+  Important states (all still HTTP 200):
+    * no telemetry in the window  -> available:false, dataQuality:"none",
+      source:"none", advice:null,
+      message:"No telemetry was received in the last N minute(s) for this device."
+    * newest sample too old       -> stale:true, source:"fallback",
+      message:"Latest telemetry is stale (Ns old); showing the last known posture."
+      (old data is never presented as the current posture)
+    * Gemini missing / down / bad JSON -> source:"fallback" with the
+      posture-specific template, message explains why. Basic coaching still works.
+    * same window queried again   -> cached:true,
+      message:"Live recommendation served from cache" (short TTL, and a NEW
+      sample invalidates it immediately)
+
+  Errors: 400 VALIDATION_ERROR (windowMinutes outside 1..120)
+          429 rate limited (AI_RATE_LIMIT_MAX)
+          500 INTERNAL_ERROR (MongoDB unavailable)
+
+
+================================================================================
+6. ERROR CODES REFERENCE
+================================================================================
+
+  400  VALIDATION_ERROR          request body/query/params failed Zod checks
+  400  MALFORMED_JSON            body is not valid JSON
+  400  INVALID_SESSION_WINDOW    session end before start
+  404  ROUTE_NOT_FOUND           unknown path
+  404  DEVICE_NOT_FOUND
+  404  TELEMETRY_NOT_FOUND
+  404  EVENT_NOT_FOUND
+  404  SESSION_NOT_FOUND
+  404  RECOMMENDATION_NOT_FOUND
+  409  DUPLICATE_RECORD          unique constraint violated
+  413  PAYLOAD_TOO_LARGE         body over REQUEST_BODY_LIMIT (default 256kb)
+  429  (rate limited)            global (RATE_LIMIT_MAX) or AI (AI_RATE_LIMIT_MAX)
+  422  NO_POSTURE_DATA           not enough data to compute statistics
+  500  INTERNAL_ERROR
+  502  BAD_GATEWAY               Gemini upstream error
+  503  DATABASE_UNAVAILABLE      Mongo not connected
+  503  GEMINI_NOT_CONFIGURED
+  504  GATEWAY_TIMEOUT           Gemini timed out
+
+
+================================================================================
+7. RECOMMENDED POSTMAN TEST SEQUENCE (happy path)
+================================================================================
+
+  1) GET  /health                                   -> expect status "ok"
+  2) POST /api/v1/telemetry        (minimal body)   -> 201 Telemetry stored
+     -> copy data.id  (use it in step 5)
+  3) POST /api/v1/telemetry        (SAME body again)-> 200 Duplicate ignored
+  4) POST /api/v1/devices/posture-belt-01/heartbeat -> 200 online, lastSeen
+  5) GET  /api/v1/history?limit=5                   -> your record present
+  6) GET  /api/v1/dashboard/current                 -> current posture
+  7) GET  /api/v1/dashboard/summary?period=day      -> totals & distribution
+  8) POST /api/v1/sessions         (deviceId)       -> 201 Session started
+     -> copy data.id  (use it in step 9)
+  9) PATCH /api/v1/sessions/<id>/end                -> 200 Session ended, final stats
+ 10) POST /api/v1/events           (VIBRATION_ALERT)-> 201 Event stored
+ 11) GET  /api/v1/events?type=VIBRATION_ALERT      -> event listed
+ 12) POST /api/v1/ai/recommendations  {}            -> 200 (or 503 if no API key)
+ 13) GET  /api/v1/ai/recommendations/live?deviceId=posture-belt-01
+                                                    -> 200 advice for the last
+                                                       10 min (source: gemini or
+                                                       fallback; never persists)
+ 14) POST 2-3 more telemetry samples, repeat step 13
+                                                    -> current posture follows
+                                                       the newest real sample
+
+  Negative / edge cases worth testing:
+    - telemetry with angle=999            -> 400 VALIDATION_ERROR
+    - telemetry with bad label "SIT"      -> 400 VALIDATION_ERROR
+    - history with from > to              -> 400 VALIDATION_ERROR
+    - GET /api/v1/devices/unknown-device  -> 404 DEVICE_NOT_FOUND
+    - GET /api/v1/history/not-an-id       -> 400 VALIDATION_ERROR
+    - very large JSON body                -> 413 PAYLOAD_TOO_LARGE
+    - hammer /api/v1/ai/recommendations   -> 429 rate limited
+    - GET .../recommendations/live?windowMinutes=0   -> 400 VALIDATION_ERROR
+    - GET .../recommendations/live?windowMinutes=999 -> 400 VALIDATION_ERROR
+    - GET .../recommendations/live (no telemetry)    -> 200 available:false
+    - GET .../recommendations/live (old samples)     -> 200 stale:true
+
+
+================================================================================
+8. POSTMAN ENVIRONMENT VARIABLES (suggested)
+================================================================================
+
+  baseUrl       = http://localhost:3000
+  deviceId      = posture-belt-01
+  mongoId       = <paste a real id from a create response>
+  localTime     = {{$isoTimestamp}}
+
+  Set request header for JSON bodies:  Content-Type: application/json
+
+
+================================================================================
+9. QUICK cURL EQUIVALENTS
+================================================================================
+
+  Health:
+    curl http://localhost:3000/health
+
+  Telemetry:
+    curl -X POST http://localhost:3000/api/v1/telemetry ^
+      -H "Content-Type: application/json" ^
+      -d "{\"deviceId\":\"posture-belt-01\",\"posture\":{\"label\":\"SLOUCHING\",\"angle\":28.4}}"
+
+  Heartbeat:
+    curl -X POST http://localhost:3000/api/v1/devices/posture-belt-01/heartbeat ^
+      -H "Content-Type: application/json" -d "{\"battery\":76}"
+
+  Summary:
+    curl "http://localhost:3000/api/v1/dashboard/summary?period=day"
+
+  Live advice:
+    curl "http://localhost:3000/api/v1/ai/recommendations/live?deviceId=posture-belt-01&windowMinutes=10"
+
+================================================================================
+10. FIX REPORT - LIVE AI RECOMMENDATIONS & THE /latest 404
+================================================================================
+
+  Date    : 2026-10-17
+  Scope   : fix the AI recommendation flow, add GET /ai/recommendations/live,
+            and repair GET /ai/recommendations/latest.
+  Rule    : no architecture rewrite - routes, envelope, models, validation and
+            every existing endpoint were preserved.
+
+--------------------------------------------------------------------------------
+10.1  ROOT CAUSE - "the data is very sparse"
+--------------------------------------------------------------------------------
+
+  Diagnosis (not a patch):
+
+  1. The ONLY AI entry point was POST /ai/recommendations with a whole-period
+     window (day = rolling 24h, week/month = calendar). Statistics were built
+     from that entire window, and the model itself was asked to judge density.
+     A device that had been running for a few minutes therefore always looked
+     "very sparse" even though its recent samples were perfectly usable.
+
+  2. Storage and schema were verified and are CORRECT:
+       - collection: telemetries (model Telemetry)
+       - posture.label stored as the enum string, posture.angle as a number
+       - timestamp stored as a real BSON Date (NOT a string)
+       - index { deviceId: 1, timestamp: -1 } exists, so window queries are
+         covered and sorted newest-first without a collection scan.
+
+  3. deviceId filtering was correct (deviceId + timestamp range + sort + limit),
+     and the dashboard and the AI path both read the same Telemetry collection,
+     so there was NO aggregation mismatch between them.
+
+  4. Timezone/timestamp handling was correct: timestamps are stored in UTC and
+     compared as Date objects, so there is no local-time offset bug.
+
+  5. No stale cache was hiding data: the cache only ever covered the historical
+     day/week/month response, keyed by a SHA-256 statistics hash.
+
+  Conclusion: the sparse warning was a real signal about the SHORT window used,
+  not about lost data. The fix is to (a) analyse a short rolling window of real
+  telemetry for live coaching and (b) report an explicit data-quality level
+  instead of a vague "sparse" impression. No threshold was lowered and no data
+  was fabricated.
+
+--------------------------------------------------------------------------------
+10.2  ROOT CAUSE - the /ai/recommendations/latest 404
+--------------------------------------------------------------------------------
+
+  NOT a missing route, NOT shadowing, NOT a wrong frontend URL, NOT a bad
+  query filter. The route was registered, mounted and matched correctly.
+
+  Actual cause (data deletion, not routing):
+      In src/modules/ai/ai.model.ts the TTL index used
+      expireAfterSeconds: AI_CACHE_TTL_SECONDS (300s). MongoDB therefore
+      DELETED every successfully stored recommendation about five minutes after
+      it was generated, so a later GET /recommendations/latest found nothing
+      and correctly returned 404 RECOMMENDATION_NOT_FOUND.
+
+  Fix (separate the two concepts that were wrongly merged):
+      * Cache freshness - a stored recommendation is only REUSED while
+        generatedAt is inside AI_CACHE_TTL_SECONDS. A stale-but-kept document
+        no longer suppresses a fresh Gemini call.
+      * Document retention - the TTL index now uses the new
+        AI_RECOMMENDATION_TTL_SECONDS (default 2,592,000s = 30 days), so
+        /latest keeps answering for a month.
+      * MongoDB cannot alter index options in place, so syncRecommendationIndexes()
+        (called once at startup) drops the legacy "recommendation_cache_ttl"
+        index and then runs syncIndexes() to create "recommendation_retention_ttl".
+
+--------------------------------------------------------------------------------
+10.3  FILES MODIFIED
+--------------------------------------------------------------------------------
+
+  src/modules/ai/ai.coaching.ts     NEW  deterministic posture-specific templates
+  src/modules/ai/ai.service.ts      live snapshot, data quality, live cache,
+                                          /latest freshness window
+  src/modules/ai/gemini.client.ts   shared Interactions-API call + live JSON schema
+  src/modules/ai/ai.model.ts        retention TTL + legacy-index cleanup
+  src/modules/ai/ai.validation.ts   liveRecommendationQuerySchema
+  src/modules/ai/ai.controller.ts   getLiveRecommendation handler
+  src/modules/ai/ai.routes.ts       GET /recommendations/live
+  src/config/env.ts                 new AI_* settings
+  src/config/swagger.ts             /ai/recommendations/live documented
+  src/server.ts                     syncRecommendationIndexes() at startup
+  src/tests/ai.test.ts              /latest regression + 14 live tests
+  .env                              AI_RECOMMENDATION_TTL_SECONDS,
+                                          AI_LIVE_WINDOW_MINUTES,
+                                          AI_LIVE_MAX_SAMPLES,
+                                          AI_LIVE_STALE_SECONDS,
+                                          AI_LIVE_CACHE_TTL_SECONDS
+
+  Responsibilities stay separate:
+      POST /ai/recommendations        generate/refresh a STORED recommendation
+      GET  /ai/recommendations/latest retrieve a STORED recommendation
+      GET  /ai/recommendations/live   generate from RECENT telemetry, with a
+                                      deterministic fallback, and persist nothing
+
+--------------------------------------------------------------------------------
+10.4  HOW THE CURRENT POSTURE IS DETERMINED
+--------------------------------------------------------------------------------
+
+  1. Load the newest samples in the rolling window:
+       filter { deviceId?, timestamp: { $gte: from, $lte: now } }
+       .sort({ timestamp: -1 }).limit(AI_LIVE_MAX_SAMPLES), then reverse to
+       chronological order (the oldest sample is the first element).
+  2. currentPosture / currentAngle  = the NEWEST sample (index length-1).
+  3. dominantPosture = the most frequent CLASSIFIED label. UNKNOWN is skipped,
+     and ties are resolved by iterating POSTURE_LABELS, so the answer is
+     deterministic. One bad reading is never reported as a trend.
+  4. Durations come from TIMESTAMP DELTAS capped by SESSION_MAX_GAP_SECONDS
+     (never "1 sample = 1 second"). UNKNOWN is excluded from good/bad time.
+  5. persistentIncorrectSeconds walks backwards from the newest sample while the
+     posture stays incorrect, and stops at a gap larger than the cap, so an
+     offline period is never reported as one long slouch.
+
+--------------------------------------------------------------------------------
+10.5  HOW LIMITED DATA IS HANDLED  (dataQuality)
+--------------------------------------------------------------------------------
+
+  none        0 samples            -> available:false, source:"none", advice null
+  limited     < 5 samples          -> a rough impression only; the summary says
+                                      "That is a limited snapshot, so no
+                                      long-term trend can be established yet."
+  recent      >= 5 samples         -> a valid recent snapshot; still no long-term
+                                      trend claimed
+  established >= 60 samples AND
+              >= 300s coverage     -> a trend may be discussed
+
+  A full day is never required, and `source:"none"` is an explicit empty state
+  rather than a crash or a fabricated reading.
+
+--------------------------------------------------------------------------------
+10.6  HOW THE GEMINI FALLBACK WORKS
+--------------------------------------------------------------------------------
+
+  The key stays on the backend only and is never exposed to the mobile app;
+  only aggregated numbers are sent (no raw sensor stream).
+
+  Order of resolution for /live:
+      1. no samples                  -> source:"none"
+      2. stale telemetry             -> source:"fallback" (no Gemini call)
+      3. cache hit for the exact
+         window + newest timestamp   -> cached:true
+      4. Gemini configured           -> source:"gemini", validated JSON
+      5. Gemini missing / timeout /
+         rate limit / bad JSON       -> source:"fallback"
+  The fallback is COACHING_BY_POSTURE: title + immediateAction + futureImpact +
+  priority per posture (GOOD_POSTURE, SLOUCHING, LEAN_LEFT, LEAN_RIGHT,
+  HEAD_FORWARD, UNKNOWN). Wording avoids medical promises - no claim of injury
+  prevention or pain relief.
+
+  Caching rules:
+      * a live answer is cached IN MEMORY only (never written to MongoDB)
+      * the key contains the newest sample ISO timestamp, so a new sample
+        invalidates it immediately
+      * TTL is short and configurable (AI_LIVE_CACHE_TTL_SECONDS)
+      * identical statistics reuse the historical cache for day/week/month;
+        refresh:true bypasses it
+      * every cached response reports cached:true plus its generatedAt
+
+--------------------------------------------------------------------------------
+10.7  TESTS EXECUTED AND ACTUAL RESULTS
+--------------------------------------------------------------------------------
+
+  Commands actually run in the project root, with real output:
+
+    npm test        ->  Test Files  8 passed (8)
+                        Tests      62 passed (62)
+                        src/tests/ai.test.ts (23 tests)  <- includes the 14 new
+                        live tests + the /latest regression test
+    npm run lint    ->  eslint .  (no errors, exit 0)
+    npm run build   ->  tsc -p tsconfig.build.json  (exit 0)
+    npm run typecheck -> tsc --noEmit -p tsconfig.json  (exit 0)
+
+  Scenarios covered by src/tests/ai.test.ts:
+    * /latest still serves a stored recommendation after the cache window
+      elapsed (the 404 regression above)
+    * live: no telemetry, a single measurement, stale telemetry, mixed labels,
+      each posture (GOOD_POSTURE, SLOUCHING, LEAN_LEFT, LEAN_RIGHT,
+      HEAD_FORWARD), dominant posture over noisy samples, established window
+    * live: device isolation (another device's samples are ignored)
+    * live: Gemini personalised answer, then served from cache on the next call,
+      and NOTHING persisted to MongoDB
+    * live: Gemini rejection -> fallback; unusable JSON -> fallback
+    * live: windowMinutes 0 and 999 -> 400 VALIDATION_ERROR
+    * live: MongoDB disconnected -> 500 INTERNAL_ERROR
+  Gemini is mocked in tests and GEMINI_API_KEY is blanked, so no live network
+  call is made and no cost is incurred.
+
+================================================================================
+  END OF FILE
+================================================================================

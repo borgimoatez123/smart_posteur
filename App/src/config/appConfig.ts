@@ -17,7 +17,7 @@
  */
 
 /** Physical-device default: LAN IP of the machine running the backend. */
-export const DEFAULT_BACKEND_URL = "http://10.68.235.96:3000";
+export const DEFAULT_BACKEND_URL = "";
 
 /** Host address that the Android emulator uses to reach the host machine. */
 export const EMULATOR_BACKEND_URL = "http://10.0.2.2:3000";
